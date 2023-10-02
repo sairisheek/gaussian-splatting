@@ -124,10 +124,12 @@ def read_points3D_binary(path_to_model_file):
         xyzs = np.empty((num_points, 3))
         rgbs = np.empty((num_points, 3))
         errors = np.empty((num_points, 1))
+        ids = {}
 
         for p_id in range(num_points):
             binary_point_line_properties = read_next_bytes(
                 fid, num_bytes=43, format_char_sequence="QdddBBBd")
+            ids[int(binary_point_line_properties[0])] = p_id
             xyz = np.array(binary_point_line_properties[1:4])
             rgb = np.array(binary_point_line_properties[4:7])
             error = np.array(binary_point_line_properties[7])
@@ -139,7 +141,7 @@ def read_points3D_binary(path_to_model_file):
             xyzs[p_id] = xyz
             rgbs[p_id] = rgb
             errors[p_id] = error
-    return xyzs, rgbs, errors
+    return xyzs, rgbs, errors, ids
 
 def read_intrinsics_text(path):
     """

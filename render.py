@@ -33,17 +33,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(depth_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        results = render(view, gaussians, pipeline, background)
+        results = render(view, gaussians, pipeline, background, sphere_crop=True)
         rendering = results["render"]
         gt = view.original_image[0:3, :, :]
         depth = results["depth"]
-        print(results["num_gauss"])
         depth[(depth < 0)] = 0
         depth = (depth / (depth.max() + 1e-5)).detach().cpu().numpy().squeeze()
         depth = (depth * 255).astype(np.uint8)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        #torchvision.utils.save_image(plt.cm.jet(depth.clone().detach().cpu()), os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
         plt.imsave(os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"), depth, cmap='jet')
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

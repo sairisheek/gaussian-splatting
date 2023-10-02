@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from tqdm import tqdm
 import os
 import random
 import json
@@ -18,6 +19,7 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
+import numpy as np
 import torch
 class Scene:
 
@@ -49,9 +51,10 @@ class Scene:
         else:
             assert False, "Could not recognize scene type!"
 
+        
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            #with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+            #    dest_file.write(src_file.read())
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
@@ -62,6 +65,7 @@ class Scene:
                 json_cams.append(camera_to_JSON(id, cam))
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
+        
 
         if shuffle:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
@@ -76,11 +80,34 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+        
 
         cam_centers = [x.camera_center for x in self.train_cameras[1.0]]
         cam_centers = torch.stack(cam_centers)
-        gaussians.avg_cam_center = torch.mean(cam_centers, dim=0) 
+        gaussians.avg_cam_center = torch.mean(cam_centers, dim=0)
+        gaussians.fg_radius = scene_info.nerf_normalization
+        
+        print('Generating Warped Views...')
+        '''
+        thetas = np.array([15])
+        append_list = []
+        for cam in tqdm(self.train_cameras[1.0]):
+            for theta in thetas:
+                append_list.append(cam.gen_rotation_extr(theta*np.pi/180, gaussians.avg_cam_center.cpu()))
+        '''
 
+        append_list = []
+        lambdas = np.array([-1,1])
+        idxs = [0,1]
+        for cam in tqdm(self.train_cameras[1.0]):
+            for lam in lambdas:
+                for idx in idxs:
+                    append_list.append(cam.translation_warp(lam, idx))
+        
+
+        random.shuffle(append_list) 
+        self.train_cameras[1.0].extend(append_list)
+        print('Done!')
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
@@ -98,3 +125,4 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    

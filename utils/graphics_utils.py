@@ -73,5 +73,8 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))
 
+def focal2dist(focal, fov):
+    return 2 * focal * math.tan(fov / 2)
+
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))

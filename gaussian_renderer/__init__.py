@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, sphere_crop=False):
     """
     Render the scene. 
     
@@ -28,6 +28,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         screenspace_points.retain_grad()
     except:
         pass
+    
+    #if sphere_crop:
+    #    dists = torch.linalg.norm(pc.get_xyz - pc.avg_cam_center, dim=1)
+    #    sphere_mask = dists <= pc.fg_radius["radius"]
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -49,6 +53,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
 
     means3D = pc.get_xyz
     means2D = screenspace_points
@@ -80,6 +85,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             shs = pc.get_features
     else:
         colors_precomp = override_color
+
+    #if sphere_crop:
+    #    means3D = means3D[sphere_mask]
+    #    means2D = means2D[sphere_mask]
+    #    shs = shs[sphere_mask]
+    #    opacity = opacity[sphere_mask]
+    #    scales = scales[sphere_mask]
+    #    rotations = rotations[sphere_mask]
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, depth, num_gauss = rasterizer(

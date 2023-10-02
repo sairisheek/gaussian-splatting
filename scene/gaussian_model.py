@@ -58,6 +58,7 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
         self.avg_cam_center = None
+        self.fg_radius = None
     def capture(self):
         return (
             self.active_sh_degree,

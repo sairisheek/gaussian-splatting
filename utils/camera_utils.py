@@ -13,6 +13,7 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from copy import deepcopy
 
 WARNED = False
 
@@ -48,8 +49,22 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
+                  image=gt_image, depth=cam_info.depth, cam_intr=cam_info.cam_intr, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+
+def loadWarpCam(cam, warp_image, mask, R_n, T_n):
+    '''
+    c = Camera(colmap_id=None, R=R_n, T=T_n, 
+                  FoVx=cam.FovX, FoVy=cam.FovY, 
+                  image=warp_image, cam_intr=cam.cam_intr, gt_alpha_mask=None,
+                  image_name=cam.image_name, uid=None, data_device='cuda')
+    '''
+    c = deepcopy(cam)
+    c.original_image = warp_image.clamp(0.0, 1.0).to('cuda')
+    c.warp_mask = mask
+    c.R = R_n
+    c.T = T_n
+    return c
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
