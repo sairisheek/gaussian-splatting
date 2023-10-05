@@ -14,9 +14,14 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import cv2
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
+
+def NP_resize(image, resolution):
+    resized_image = cv2.resize(image, resolution, interpolation=cv2.INTER_CUBIC)
+    return resized_image
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
