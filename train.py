@@ -14,8 +14,10 @@ import torch
 from torchmetrics import PearsonCorrCoef
 from kornia.losses import inverse_depth_smoothness_loss
 
+from icecream import ic
+
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim
+from utils.loss_utils import l1_loss, l2_loss, ssim, LaplacianLayer, Sobel
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -30,7 +32,6 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras):
@@ -55,6 +56,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     pearson = PearsonCorrCoef().to('cuda')
+    laplacian = LaplacianLayer().to('cuda')
+    gradient = Sobel().to('cuda')
     for iteration in range(first_iter, opt.iterations + 1):        
         '''
         if network_gui.conn == None:
@@ -95,16 +98,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        depth_loss =None
-        smoothness_loss = inverse_depth_smoothness(depth, gt_image)
+        smoothness_loss = None
+        depth_loss = None
+        gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
 
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         if dataset.lambda_depth > 0:
             depth_loss = pearson_depth_loss(depth, viewpoint_cam.depth, pearson)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + dataset.lambda_depth*depth_loss + 0.1*smoothness_loss
-        else:
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
+            loss += dataset.lambda_depth*depth_loss 
+        if dataset.lambda_smoothness > 0:
+            smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
+            loss += dataset.lambda_smoothness * smoothness_loss
+            
         loss.backward()
-
         iter_end.record()
 
         with torch.no_grad():
@@ -147,6 +154,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 def pearson_depth_loss(depth_src, depth_target, pearson):
     co = pearson(depth_src.reshape(-1), depth_target.reshape(-1))
     return 1 - co
+
+def second_smoothness_loss(depth, img, laplacian, gradient):
+        img_lap = laplacian(img.unsqueeze(0), do_normalize=False)
+        depth_grad_x, depth_grad_y = torch.tensor_split(gradient(depth.unsqueeze(0)), 2, dim=1)
+        depth_grad_x2, depth_grad_xy = torch.tensor_split(gradient(depth_grad_x), 2, dim=1)
+        depth_grad_yx, depth_grad_y2 = torch.tensor_split(gradient(depth_grad_y), 2, dim=1)
+        
+        x = torch.exp(-img_lap) * (depth_grad_x2.abs() \
+            + depth_grad_xy.abs() + depth_grad_y2.abs())
+        return x.mean()
+
+
+
+def depth_ranking_loss(depth_src, depth_target, margin):
+    # generate N random pairs of pixels within depth_src and depth_target
+    loss = 0
+    
+    ds_flat = 1/(1+depth_src.reshape(-1))
+    dt_flat = 1/(1+depth_target.reshape(-1))
+
+    idxs1 = torch.randperm(depth_src.shape[0])
+    idxs2 = torch.randperm(depth_src.shape[0])
+
+    ds_rand1 = ds_flat[idxs1]
+    ds_rand2 = ds_flat[idxs2]
+
+    dt_rand1 = dt_flat[idxs1]
+    dt_rand2 = dt_flat[idxs2]
+
+    mask = ds_rand1 > ds_rand2 # get mask of pairs that are higher in first coordinate
+    loss += torch.sum(torch.clamp(margin + dt_rand2 - dt_rand1, min=0.0) * (1.0 - mask.float()))
+    loss += torch.sum(torch.clamp(margin + dt_rand1 - dt_rand2, min=0.0) * (mask.float()))
+
+    return loss
+    
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

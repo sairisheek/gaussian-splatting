@@ -14,6 +14,39 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
+import torch.nn as nn
+
+class LaplacianLayer(nn.Module):
+    def __init__(self):
+        super(LaplacianLayer, self).__init__()
+        self.filter = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding='same', padding_mode='replicate', bias=False)
+
+        w_nom = torch.FloatTensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]).unsqueeze(0).unsqueeze(0).expand(1,3,3,3)
+        self.filter.weight = nn.Parameter(w_nom, requires_grad=False)
+
+        #w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
+        #w_nom.requires_grad = False
+        #w_den.requires_grad = False
+    
+
+    def forward(self, input, do_normalize=True):
+        laplacian = self.filter(input)
+        return laplacian
+
+class Sobel(nn.Module):
+	def __init__(self):
+		super().__init__()
+		self.filter = nn.Conv2d(in_channels=1, out_channels=2, kernel_size=3, stride=1, padding='same', padding_mode='replicate', bias=False)
+		Gx = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]])
+		Gy = torch.tensor([[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]])
+		G = torch.cat([Gx.unsqueeze(0), Gy.unsqueeze(0)], 0)
+		G = G.unsqueeze(1)
+		self.filter.weight = nn.Parameter(G, requires_grad=False)
+	def forward(self, img):
+		x = self.filter(img)
+		return x
+
+
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 

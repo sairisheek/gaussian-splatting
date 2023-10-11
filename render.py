@@ -44,7 +44,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         depth = results["depth"]
         num_gauss = (results["num_gauss"])/results["num_gauss"].max()
         accum_alpha = results["accum_alpha"]
-        print(accum_alpha.max())
+        #print(accum_alpha.max())
         #print(results["num_gauss"].mean(dtype=torch.float32))
         depth[(depth < 0)] = 0
         depth = (depth / (depth.max() + 1e-5)).detach().cpu().numpy().squeeze()
