@@ -14,6 +14,13 @@ from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
+
+def build_rot_y(th):
+        return torch.Tensor([
+        [np.cos(th), 0, -np.sin(th)],
+        [0, 1, 0],
+        [np.sin(th), 0, np.cos(th)]])
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, depth, gt_alpha_mask,
                  image_name, uid,
@@ -56,6 +63,26 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        
+        def gen_hemisphere_view(self, theta, center):
+            cam_focus = torch.Tensor(self.T) - center
+            rot_y = build_rot_y(theta)
+            t_n = torch.Tensor(rot_y @ cam_focus + center)
+
+            E_ref = torch.Tensor(getWorld2View2(self.R, self.T))
+            E_n = torch.Tensor(getWorld2View2(self.R, t_n))
+            ref_img = torch.Tensor(self.original_image).cpu()
+            ref_depth = torch.Tensor(self.depth)
+            K_ref = torch.Tensor(self.cam_intr)
+
+            new_look_at = center - t_n
+            new_look_at = new_look_at / torch.linalg.norm(new_look_at)
+            new_right = rot_y @ self.R[:,1]
+            new_right = new_right / torch.linalg.norm(new_right)
+            new_up = torch.cross(new_look_at.float(), new_right.float())
+
+            R_n = torch.stack((new_right, new_up, new_look_at), dim=1)
+
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

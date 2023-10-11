@@ -12,11 +12,13 @@
 import os
 import random
 import json
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
 
 class Scene:
 
@@ -68,11 +70,16 @@ class Scene:
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
+
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+        
+        cam_centers = [x.camera_center for x in self.train_cameras[1.0]]
+        cam_centers = torch.stack(cam_centers)
+        gaussians.avg_cam_center = torch.mean(cam_centers, dim=0)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,

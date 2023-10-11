@@ -108,7 +108,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
             loss += dataset.lambda_depth*depth_loss 
         if dataset.lambda_smoothness > 0:
-            smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
+            #smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
+            smoothness_loss = inverse_depth_smoothness_loss(depth.unsqueeze(0), image.unsqueeze(0))
             loss += dataset.lambda_smoothness * smoothness_loss
             
         loss.backward()

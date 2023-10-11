@@ -13,6 +13,7 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch, NP_resize
 from utils.graphics_utils import fov2focal
+import torch
 
 WARNED = False
 
@@ -60,6 +61,7 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
         camera_list.append(loadCam(args, id, c, resolution_scale))
 
     return camera_list
+
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))
