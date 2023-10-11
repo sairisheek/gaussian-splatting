@@ -225,11 +225,11 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
         true_depth = reg.predict(info.depth.reshape(-1, 1)).reshape(H, W)
      
-        #rel_x = np.linspace(0, rel_depth.max())
-        #plt.figure(i)
-        #plt.scatter(rel_depth, col_depth)
-        #plt.plot(rel_x, reg.predict(rel_x[:,None]))
-        #plt.show()
+        # rel_x = np.linspace(0, rel_depth.max())
+        # plt.figure(i)
+        # plt.scatter(rel_depth, col_depth)
+        # plt.plot(rel_x, reg.predict(rel_x[:,None]))
+        # plt.show()
         #print(np.concatenate([minpts, np.ones((2,1))], axis=-1))
         #print(info.depth.shape)
         info.depth = true_depth

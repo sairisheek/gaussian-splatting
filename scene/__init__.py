@@ -89,11 +89,11 @@ class Scene:
         
         print('Generating Warped Views...')
         
-        thetas = np.array([10])
+        thetas = np.array([5])
         append_list = []
         for cam in tqdm(self.train_cameras[1.0]):
             for theta in thetas:
-                append_list.append(cam.gen_rotation_extr(theta*np.pi/180, gaussians.avg_cam_center.cpu()))
+                append_list.append(cam.gen_rotation_extr(theta*np.pi/180, gaussians.avg_cam_center.cpu().numpy()))
     
 
         '''
