@@ -88,14 +88,15 @@ class Scene:
         gaussians.fg_radius = scene_info.nerf_normalization
         
         print('Generating Warped Views...')
-        '''
-        thetas = np.array([15])
+        
+        thetas = np.array([10])
         append_list = []
         for cam in tqdm(self.train_cameras[1.0]):
             for theta in thetas:
                 append_list.append(cam.gen_rotation_extr(theta*np.pi/180, gaussians.avg_cam_center.cpu()))
-        '''
+    
 
+        '''
         append_list = []
         lambdas = np.array([-1,1])
         idxs = [0,1]
@@ -103,7 +104,7 @@ class Scene:
             for lam in lambdas:
                 for idx in idxs:
                     append_list.append(cam.translation_warp(lam, idx))
-        
+        '''
 
         random.shuffle(append_list) 
         self.train_cameras[1.0].extend(append_list)

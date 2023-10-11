@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 def loadWarpCam(cam, warp_image, mask, R_n, T_n):
     image = torch.Tensor(warp_image).detach().cuda().permute(2,0,1)
-    c = Camera(colmap_id=None, R=R_n, T=T_n, 
+    c = Camera(colmap_id=None, R=R_n.numpy(), T=T_n, 
                   FoVx=cam.FoVx, FoVy=cam.FoVy, 
                   image=image, depth=None, cam_intr=cam.cam_intr, gt_alpha_mask=None,
                   image_name=cam.image_name, uid=None, data_device='cuda')
@@ -36,20 +36,6 @@ def loadWarpCam(cam, warp_image, mask, R_n, T_n):
 
     return c
 
-def look_at(camera_position, camera_target, up_vector):
-	vector = camera_position - camera_target
-	vector = vector / np.linalg.norm(vector)
-
-	vector2 = np.cross(up_vector, vector)
-	vector2 = vector2 / np.linalg.norm(vector2)
-
-	vector3 = np.cross(vector, vector2)
-	return np.array([
-		[vector2[0], vector3[0], vector[0], 0.0],
-		[vector2[1], vector3[1], vector[1], 0.0],
-		[vector2[2], vector3[2], vector[2], 0.0],
-		[-np.dot(vector2, camera_position), -np.dot(vector3, camera_position), np.dot(vector, camera_position), 1.0]
-	])
 
 
 class Camera(nn.Module):
@@ -194,7 +180,7 @@ class Camera(nn.Module):
     def gen_rotation_extr(self, theta, center):
         cam_focus = torch.Tensor(self.T) - center
         rot_y = self.build_rot_y(theta)
-        R_n = self.R @ rot_y.numpy() #they store the transpose
+        #R_n = rot_y.numpy @ self.R #they store the transpose
         t_n = torch.Tensor(rot_y @ cam_focus + center)
 
         E_ref = torch.Tensor(getWorld2View2(self.R, self.T))
@@ -203,8 +189,15 @@ class Camera(nn.Module):
         ref_depth = torch.Tensor(self.depth)
         K_ref = torch.Tensor(self.cam_intr)
 
-        img, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
+        new_look_at = center - t_n
+        new_look_at = new_look_at / torch.linalg.norm(new_look_at)
+        new_right = rot_y @ self.R[:,1]
+        new_right = new_right / torch.linalg.norm(new_right)
+        new_up = torch.cross(new_look_at.float(), new_right.float())
 
+        R_n = torch.stack((new_right, new_up, new_look_at), dim=1)
+
+        img, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
 
         
         plt.subplot(1,4,1)
