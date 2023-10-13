@@ -44,7 +44,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, step=args.step, max_cameras=args.max_cameras)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -83,13 +83,14 @@ class Scene:
         
 
         cam_centers = [x.camera_center for x in self.train_cameras[1.0]]
+        print(len(cam_centers))
         cam_centers = torch.stack(cam_centers)
         gaussians.avg_cam_center = torch.mean(cam_centers, dim=0)
         gaussians.fg_radius = scene_info.nerf_normalization
         
         print('Generating Warped Views...')
         
-        thetas = np.array([5])
+        thetas = np.array([-10, -7, -5, 5, 7, 10])
         append_list = []
         for cam in tqdm(self.train_cameras[1.0]):
             for theta in thetas:
@@ -107,7 +108,8 @@ class Scene:
         '''
 
         random.shuffle(append_list) 
-        self.train_cameras[1.0].extend(append_list)
+        #self.train_cameras[1.0].extend(append_list)
+        self.warp_cameras = append_list
         print('Done!')
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -126,4 +128,7 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getWarpCameras(self):
+        return self.warp_cameras
     

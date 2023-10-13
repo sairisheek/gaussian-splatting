@@ -11,8 +11,8 @@
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
-from utils.graphics_utils import fov2focal
+from utils.general_utils import PILtoTorch, NP_resize
+from utils.graphics_utils import focal2fov, fov2focal
 from copy import deepcopy
 
 WARNED = False
@@ -20,6 +20,7 @@ WARNED = False
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
+    scale=None
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
     else:  # should be a type that converts to float
@@ -38,8 +39,20 @@ def loadCam(args, id, cam_info, resolution_scale):
 
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
+     
 
+    resolution_warp = round(orig_w/8), round(orig_h/8)
+    scale = 8
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    warp_resized_image = PILtoTorch(cam_info.image, resolution_warp)
+
+    resized_depth = NP_resize(cam_info.depth, resolution)
+    resized_depth_warp = NP_resize(cam_info.depth, resolution_warp)
+    intr = cam_info.cam_intr
+
+    resized_intr = np.array([[intr[0,0]/scale, 0, (resolution_warp[0]-1)/2],
+                            [0, intr[1, 1]/scale, (resolution_warp[1]-1)/2],
+                            [0,0,1]])
 
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None
@@ -47,10 +60,13 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, depth=cam_info.depth, cam_intr=cam_info.cam_intr, gt_alpha_mask=loaded_mask,
+    c = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                  FoVx=focal2fov(resized_intr[0,0], resolution_warp[0]), FoVy=focal2fov(resized_intr[1,1], resolution_warp[1]), 
+                  image=warp_resized_image, depth=resized_depth, cam_intr=resized_intr, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    c.w_image = warp_resized_image
+    c.w_depth = resized_depth_warp
+    return c
 
 def loadWarpCam(cam, warp_image, mask, R_n, T_n):
     '''

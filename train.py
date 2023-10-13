@@ -11,7 +11,9 @@
 
 import os
 import torch
-from random import randint
+from random import randint, random
+from torchmetrics import PearsonCorrCoef
+
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -45,10 +47,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    warp_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
+    pearson = PearsonCorrCoef().to('cuda')
 
     
 
@@ -78,25 +82,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        if dataset.warp_prob > 0:
+            if random() < dataset.warp_prob:
+                if not warp_stack:
+                    warp_stack = scene.getWarpCameras().copy()
+                viewpoint_cam = warp_stack.pop(randint(0, len(warp_stack)-1))
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+
+        
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        if viewpoint_cam.warp_mask is not None:
-            image = viewpoint_cam.warp_mask * image
+        
             
-        Ll1 = l1_loss(image, gt_image)
+        loss = None
+        Ll1 = None
+        depth_loss= None 
+        if viewpoint_cam.warp_mask is not None:
+           
+            depth_loss = pearson_depth_loss(depth, viewpoint_cam.warp_depth, viewpoint_cam.warp_mask, pearson)
+            #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
+            loss = dataset.lambda_depth*depth_loss
+        else:
+            Ll1 = l1_loss(image, gt_image)
             
         
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
 
         iter_end.record()
@@ -111,7 +132,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -139,7 +160,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     
+def pearson_depth_loss(depth_src, depth_target, mask, pearson):
+    fmask = mask.reshape(-1)
+    co = pearson(depth_src.reshape(-1)[fmask], depth_target.reshape(-1)[fmask])
 
+    return 1 - co
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -162,9 +187,13 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+
+        if(Ll1 is not None):
+            tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        if(depth_loss is not None):
+            tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 

@@ -13,26 +13,28 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2dist
-from utils.general_utils import PILtoTorch
+from utils.general_utils import PILtoTorch, NP_resize
 from copy import deepcopy
-
+from scipy.interpolate import griddata
+from torchvision import transforms
 
 import matplotlib.pyplot as plt
 
 
-def loadWarpCam(cam, warp_image, mask, R_n, T_n):
-    image = torch.Tensor(warp_image).detach().cuda().permute(2,0,1)
+def loadWarpCam(cam, img, warp_depth, mask, R_n, T_n):
+    
+    img = torch.Tensor(img).cuda().permute(2,0,1)
     c = Camera(colmap_id=None, R=R_n, T=T_n, 
                   FoVx=cam.FoVx, FoVy=cam.FoVy, 
-                  image=image, depth=None, cam_intr=cam.cam_intr, gt_alpha_mask=None,
+                  image=img, depth=cam.depth, cam_intr=cam.cam_intr, gt_alpha_mask=None,
                   image_name=cam.image_name, uid=None, data_device='cuda')
-    
     #c = deepcopy(cam)
     #c.original_image = warp_image.detach().cuda()
     #c.R = R_n
     #c.T = T_n
     #convert below tensor to boolean
-    c.warp_mask = torch.Tensor(mask).unsqueeze(0).detach().cuda()
+    c.warp_mask = (torch.Tensor(mask) > 0).unsqueeze(0).detach().cuda()
+    c.warp_depth = torch.Tensor(warp_depth).detach().cuda()
 
     return c
 
@@ -53,6 +55,10 @@ class Camera(nn.Module):
         self.FoVy = FoVy
         self.image_name = image_name
         self.cam_intr = cam_intr
+        self.warp_depth = None
+
+        self.w_image=None
+        self.w_depth=None
 
         try:
             self.data_device = torch.device(data_device)
@@ -61,15 +67,15 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
+        if image is not None:
+            self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
+            self.image_width = self.original_image.shape[2]
+            self.image_height = self.original_image.shape[1]
+            if gt_alpha_mask is not None:
+                self.original_image *= gt_alpha_mask.to(self.data_device)
+            else:
+                self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
         self.depth = depth
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
-
-        if gt_alpha_mask is not None:
-            self.original_image *= gt_alpha_mask.to(self.data_device)
-        else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -129,27 +135,35 @@ class Camera(nn.Module):
         new_depth = np.zeros_like(depth_src)
         yy_base, xx_base = torch.meshgrid([torch.arange(
             0, height, dtype=torch.long, device=depth_ref.device), torch.arange(0, width, dtype=torch.long)])
-        y_res = np.clip(y_res.numpy(), 0, height - 1).astype(np.int64)
-        x_res = np.clip(x_res.numpy(), 0, width - 1).astype(np.int64)
+        y_res = np.clip(y_res.numpy(), 0, height - 1).round().astype(np.int64)
+        x_res = np.clip(x_res.numpy(), 0, width - 1).round().astype(np.int64)
 
         mask = np.zeros_like(depth_ref.squeeze(0))
         mask[y_res, x_res] = 1
 
         sort_idxs = depth_ref.flatten().argsort(descending=True)
 
-        orig_shape = y_res.shape
-        y_res = y_res.flatten()[sort_idxs].reshape(orig_shape)
-        x_res = x_res.flatten()[sort_idxs].reshape(orig_shape)
-        yy_base = yy_base.flatten()[sort_idxs].reshape(orig_shape)
-        xx_base = xx_base.flatten()[sort_idxs].reshape(orig_shape)
+        #orig_shape = y_res.shape
+        y_res = y_res.flatten()#[sort_idxs].reshape(orig_shape)
+        x_res = x_res.flatten()#[sort_idxs].reshape(orig_shape)
+        yy_base = yy_base.flatten()#[sort_idxs].reshape(orig_shape)
+        xx_base = xx_base.flatten()#[sort_idxs].reshape(orig_shape)
 
-        new[y_res, x_res] = data[yy_base, xx_base]
-        new_depth[y_res, x_res] = depth_src[yy_base, xx_base]
-        depth_mask=None
+        #new = griddata(np.stack((x_res, y_res) , dim=1), data, (xx_base, yy_base), method='cubic')
+
+        
+        for i in range(yy_base.shape[0]):
+            if new_depth[y_res[i], x_res[i]] == 0 or new_depth[y_res[i], x_res[i]] > depth_src[yy_base[i], xx_base[i]]:
+                new_depth[y_res[i], x_res[i]] = depth_src[yy_base[i], xx_base[i]]
+                new[y_res[i], x_res[i]] = data[yy_base[i], xx_base[i]]
+        
+        #new[y_res, x_res] = data[yy_base, xx_base]
+        #new_depth[y_res, x_res] = depth_src[yy_base, xx_base]
+        #depth_mask=None
         #one = torch.ones_like(new_depth)
         #depth_mask = torch.zeros_like(new_depth)
         #depth_mask[y_res, x_res] = one[yy_base, xx_base]
-        return new, mask
+        return new, new_depth, mask
     
     def translation_warp(self, lam, idx):
         #width = focal2dist(self.cam_intr[0,0], self.FoVx)
@@ -161,9 +175,9 @@ class Camera(nn.Module):
         ref_depth = torch.Tensor(self.depth)
         K_ref = torch.Tensor(self.cam_intr)
 
-        img, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
+        img, depth, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
 
-        '''
+        
         plt.subplot(1,4,1)
         plt.imshow(ref_img.numpy().transpose(1,2,0))
         plt.subplot(1,4,2)
@@ -173,9 +187,9 @@ class Camera(nn.Module):
         plt.subplot(1,4,4)
         plt.imshow(mask)
         plt.show()
-        '''
+        
 
-        return loadWarpCam(self, img, mask, self.R, t_n)
+        return loadWarpCam(self, img, mask, R_n, t_n)
 
     def gen_rotation_extr(self, theta, center):
         cam_focus = self.T - center
@@ -185,8 +199,9 @@ class Camera(nn.Module):
 
         E_ref = torch.Tensor(getWorld2View2(self.R, self.T))
         
-        ref_img = torch.Tensor(self.original_image).cpu()
-        ref_depth = torch.Tensor(self.depth)
+        scale = 4
+        ref_img = torch.Tensor((self.w_image)).cpu()
+        ref_depth = torch.Tensor(self.w_depth)        
         K_ref = torch.Tensor(self.cam_intr)
 
         # new_look_at = center - t_n
@@ -196,24 +211,24 @@ class Camera(nn.Module):
         # new_up = np.cross(new_look_at, new_right)
 
         # R_n = np.stack((new_right, new_up, new_look_at), axis=1)
-        R_n = self.R @ rot_y 
-        E_n = torch.Tensor(getWorld2View2(R_n, t_n))
+        R_n = self.R @ rot_y
+        E_n = torch.Tensor(getWorld2View2(self.R, t_n))
 
 
-        img, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
+        img, depth, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
 
         
-        plt.subplot(1,4,1)
-        plt.imshow(ref_img.numpy().transpose(1,2,0))
-        plt.subplot(1,4,2)
-        plt.imshow(img)
-        plt.subplot(1,4,3)
-        plt.imshow(self.depth)
-        plt.subplot(1,4,4)
-        plt.imshow(mask)
-        plt.show()
+        # plt.subplot(1,4,1)
+        # plt.imshow(ref_img.numpy().transpose(1,2,0))
+        # plt.subplot(1,4,2)
+        # plt.imshow(img)
+        # plt.subplot(1,4,3)
+        # plt.imshow(self.depth)
+        # plt.subplot(1,4,4)
+        # plt.imshow(depth)
+        # plt.show()
         
-        return loadWarpCam(self, img, mask, R_n, t_n)
+        return loadWarpCam(self, img, depth, mask, R_n, t_n)
     
     
 

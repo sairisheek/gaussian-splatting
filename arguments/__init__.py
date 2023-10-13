@@ -54,6 +54,10 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.warp_prob = 0.0
+        self.lambda_depth = 0.0
+        self.max_cameras = -1
+        self.step = 1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
