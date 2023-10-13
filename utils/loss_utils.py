@@ -17,6 +17,10 @@ from math import exp
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
+def l1_loss_masked(network_output, gt, mask):
+    fmask = mask.repeat(3,1,1).flatten()
+    return torch.abs((network_output.flatten()[fmask] - gt.flatten()[fmask])).mean()
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 

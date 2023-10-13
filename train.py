@@ -14,7 +14,8 @@ import torch
 from random import randint, random
 from torchmetrics import PearsonCorrCoef
 
-from utils.loss_utils import l1_loss, ssim
+
+from utils.loss_utils import l1_loss, ssim, l1_loss_masked
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -87,10 +88,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if not warp_stack:
                     warp_stack = scene.getWarpCameras().copy()
                 viewpoint_cam = warp_stack.pop(randint(0, len(warp_stack)-1))
-        else:
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            else:
+                if not viewpoint_stack:
+                    viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
 
         
@@ -100,7 +101,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
-
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         
@@ -111,8 +111,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.warp_mask is not None:
            
             depth_loss = pearson_depth_loss(depth, viewpoint_cam.warp_depth, viewpoint_cam.warp_mask, pearson)
+            Ll1 = l1_loss_masked(image, gt_image, viewpoint_cam.warp_mask)
             #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
-            loss = dataset.lambda_depth*depth_loss
+            loss = dataset.lambda_depth*depth_loss + (1 - opt.lambda_dssim) * Ll1
         else:
             Ll1 = l1_loss(image, gt_image)
             

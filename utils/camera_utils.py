@@ -61,26 +61,13 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = resized_image_rgb[3:4, ...]
 
     c = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=focal2fov(resized_intr[0,0], resolution_warp[0]), FoVy=focal2fov(resized_intr[1,1], resolution_warp[1]), 
-                  image=warp_resized_image, depth=resized_depth, cam_intr=resized_intr, gt_alpha_mask=loaded_mask,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  image=resized_image_rgb, depth=resized_depth, cam_intr=resized_intr, warp_res=resolution_warp, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
     c.w_image = warp_resized_image
     c.w_depth = resized_depth_warp
     return c
 
-def loadWarpCam(cam, warp_image, mask, R_n, T_n):
-    '''
-    c = Camera(colmap_id=None, R=R_n, T=T_n, 
-                  FoVx=cam.FovX, FoVy=cam.FovY, 
-                  image=warp_image, cam_intr=cam.cam_intr, gt_alpha_mask=None,
-                  image_name=cam.image_name, uid=None, data_device='cuda')
-    '''
-    c = deepcopy(cam)
-    c.original_image = warp_image.clamp(0.0, 1.0).to('cuda')
-    c.warp_mask = mask
-    c.R = R_n
-    c.T = T_n
-    return c
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

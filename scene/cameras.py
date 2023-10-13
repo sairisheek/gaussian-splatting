@@ -12,11 +12,12 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2dist
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2dist, focal2fov
 from utils.general_utils import PILtoTorch, NP_resize
 from copy import deepcopy
 from scipy.interpolate import griddata
 from torchvision import transforms
+import cv2
 
 import matplotlib.pyplot as plt
 
@@ -24,9 +25,12 @@ import matplotlib.pyplot as plt
 def loadWarpCam(cam, img, warp_depth, mask, R_n, T_n):
     
     img = torch.Tensor(img).cuda().permute(2,0,1)
+
+    resized_intr = cam.cam_intr
+    
     c = Camera(colmap_id=None, R=R_n, T=T_n, 
-                  FoVx=cam.FoVx, FoVy=cam.FoVy, 
-                  image=img, depth=cam.depth, cam_intr=cam.cam_intr, gt_alpha_mask=None,
+                  FoVx=focal2fov(resized_intr[0,0], cam.warp_res[0]), FoVy=focal2fov(resized_intr[1,1], cam.warp_res[1]), 
+                  image=img, depth=cam.depth, cam_intr=cam.cam_intr, warp_res=None, gt_alpha_mask=None,
                   image_name=cam.image_name, uid=None, data_device='cuda')
     #c = deepcopy(cam)
     #c.original_image = warp_image.detach().cuda()
@@ -41,7 +45,7 @@ def loadWarpCam(cam, img, warp_depth, mask, R_n, T_n):
 
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, depth, cam_intr, gt_alpha_mask,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, depth, cam_intr, warp_res, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
@@ -56,9 +60,10 @@ class Camera(nn.Module):
         self.image_name = image_name
         self.cam_intr = cam_intr
         self.warp_depth = None
-
+        self.warp_res = warp_res
         self.w_image=None
         self.w_depth=None
+        
 
         try:
             self.data_device = torch.device(data_device)
@@ -199,7 +204,6 @@ class Camera(nn.Module):
 
         E_ref = torch.Tensor(getWorld2View2(self.R, self.T))
         
-        scale = 4
         ref_img = torch.Tensor((self.w_image)).cpu()
         ref_depth = torch.Tensor(self.w_depth)        
         K_ref = torch.Tensor(self.cam_intr)
@@ -217,13 +221,15 @@ class Camera(nn.Module):
 
         img, depth, mask = self.forward_warp(ref_img.cpu().clone().detach().unsqueeze(0), ref_depth.clone().detach().unsqueeze(0), K_ref.unsqueeze(0), E_ref.unsqueeze(0), K_ref.unsqueeze(0), E_n.unsqueeze(0))
 
-        
+        kernel = np.ones((5, 5), np.uint8) 
+        mask = cv2.erode(mask, kernel, iterations=1)
+
         # plt.subplot(1,4,1)
         # plt.imshow(ref_img.numpy().transpose(1,2,0))
         # plt.subplot(1,4,2)
         # plt.imshow(img)
         # plt.subplot(1,4,3)
-        # plt.imshow(self.depth)
+        # plt.imshow(mask)
         # plt.subplot(1,4,4)
         # plt.imshow(depth)
         # plt.show()
