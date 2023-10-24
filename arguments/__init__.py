@@ -56,6 +56,8 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.lambda_depth = 0.0
         self.lambda_smoothness = 0.0
+        self.lambda_semantic = 0.0
+        self.semantic_loss_interval = 1
 
         super().__init__(parser, "Loading Parameters", sentinel)
 

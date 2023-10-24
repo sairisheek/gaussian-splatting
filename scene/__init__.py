@@ -41,6 +41,7 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.holdout_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, step=step, max_cameras=max_cameras)
@@ -76,6 +77,8 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            print("Loading Holdout Cameras")
+            self.holdout_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.hold_cameras, resolution_scale, args)
         
         cam_centers = [x.camera_center for x in self.train_cameras[1.0]]
         cam_centers = torch.stack(cam_centers)
@@ -98,3 +101,6 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+    def getHoldoutCameras(self, scale=1.0):
+        return self.holdout_cameras[scale]

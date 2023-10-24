@@ -10,12 +10,13 @@
 #
 
 import os
+import numpy as np
 import torch
 from torchmetrics import PearsonCorrCoef
 from kornia.losses import inverse_depth_smoothness_loss
 
 from icecream import ic
-
+import clip_utils
 from random import randint
 from utils.loss_utils import l1_loss, l2_loss, ssim, LaplacianLayer, Sobel
 from gaussian_renderer import render, network_gui
@@ -27,19 +28,35 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def setup_clip(cams):
+    with torch.no_grad():
+        clip_utils.load_vit(root = os.path.expanduser("~/.cache/clip"))
+        embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=-1)
+        targets = torch.stack([x.original_image for x in cams], dim=0)
+        targets = torch.nn.functional.interpolate(targets, (224, 224), mode='bicubic')
+        targets.requires_grad = False
+        target_embed = embed(targets)
+    return embed, target_embed
+
+
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras):
+   
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, step=step, max_cameras=max_cameras)
     gaussians.training_setup(opt)
+    embed, target_embed  = setup_clip(scene.getTrainCameras())
+
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -51,13 +68,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    holdout_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    pearson = PearsonCorrCoef().to('cuda')
-    laplacian = LaplacianLayer().to('cuda')
-    gradient = Sobel().to('cuda')
+    #pearson = PearsonCorrCoef().to('cuda')
+    #laplacian = LaplacianLayer().to('cuda')
+    #gradient = Sobel().to('cuda')
+
     for iteration in range(first_iter, opt.iterations + 1):        
         '''
         if network_gui.conn == None:
@@ -85,9 +104,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        semantic_loss_iter = iteration % dataset.semantic_loss_interval == 0
+        do_semantic = dataset.lambda_semantic > 0 and semantic_loss_iter
+        if do_semantic:
+            if not holdout_stack:
+                holdout_stack = scene.getHoldoutCameras().copy()
+            viewpoint_cam = holdout_stack.pop(randint(0, len(holdout_stack)-1))
+        else: 
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
         if (iteration - 1) == debug_from:
@@ -96,13 +122,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+
+        if not do_semantic:
+            gt_image = viewpoint_cam.original_image.cuda()
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
         smoothness_loss = None
         depth_loss = None
-        gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
+        semantic_loss = None
+        #gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         if dataset.lambda_depth > 0:
             depth_loss = pearson_depth_loss(depth, viewpoint_cam.depth, pearson)
             #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
@@ -111,7 +141,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
             smoothness_loss = inverse_depth_smoothness_loss(depth.unsqueeze(0), image.unsqueeze(0))
             loss += dataset.lambda_smoothness * smoothness_loss
-            
+        
+        if do_semantic:
+            image_resize = torch.nn.functional.interpolate(image.unsqueeze(0), (224, 224), mode='bicubic')
+            render_embed = embed(image_resize)[0][0] # N = 1, and get [CLS] token embedding
+            target_i = np.random.randint(0, target_embed.shape[0])
+            semantic_loss = -torch.cosine_similarity(render_embed, target_embed[target_i, 0], dim=-1)
+            loss = semantic_loss * dataset.lambda_semantic
         loss.backward()
         iter_end.record()
 
@@ -125,7 +161,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, semantic_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -215,12 +251,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, semantic_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         if depth_loss is not None:
             tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
         if smoothness_loss is not None:
             tb_writer.add_scalar('train_loss_patches/smoothness_loss', smoothness_loss.item(), iteration)
+        if semantic_loss is not None:
+            tb_writer.add_scalar('train_loss_patches/semantic_loss', semantic_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
