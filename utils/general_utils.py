@@ -16,7 +16,8 @@ import numpy as np
 import random
 import cv2
 
-
+def normalize(x):
+    return (x - x.min())/(x.max() - x.min())
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torchmetrics import PearsonCorrCoef
 from kornia.losses import inverse_depth_smoothness_loss
+import math
 
 from icecream import ic
 import clip_utils
@@ -22,7 +23,7 @@ from utils.loss_utils import l1_loss, l2_loss, ssim, LaplacianLayer, Sobel
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, normalize
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -55,7 +56,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, step=step, max_cameras=max_cameras)
     gaussians.training_setup(opt)
-    embed, target_embed  = setup_clip(scene.getTrainCameras())
+    #embed, target_embed  = setup_clip(scene.getTrainCameras())
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -73,12 +74,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    #pearson = PearsonCorrCoef().to('cuda')
+    pearson = PearsonCorrCoef().to('cuda')
     #laplacian = LaplacianLayer().to('cuda')
     #gradient = Sobel().to('cuda')
-
+    last_prune_iter = 0
     for iteration in range(first_iter, opt.iterations + 1):        
-        '''
+        '''    
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -94,7 +95,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
         '''
-
+        
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -104,16 +105,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        semantic_loss_iter = iteration % dataset.semantic_loss_interval == 0
-        do_semantic = dataset.lambda_semantic > 0 and semantic_loss_iter
-        if do_semantic:
-            if not holdout_stack:
-                holdout_stack = scene.getHoldoutCameras().copy()
-            viewpoint_cam = holdout_stack.pop(randint(0, len(holdout_stack)-1))
-        else: 
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
         if (iteration - 1) == debug_from:
@@ -123,14 +118,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
 
-        if not do_semantic:
-            gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+         
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+       
 
         smoothness_loss = None
         depth_loss = None
         semantic_loss = None
+        ranking_loss = None
+        tv_loss = None
         #gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
 
         if dataset.lambda_depth > 0:
@@ -141,13 +139,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
             smoothness_loss = inverse_depth_smoothness_loss(depth.unsqueeze(0), image.unsqueeze(0))
             loss += dataset.lambda_smoothness * smoothness_loss
+        if dataset.lambda_ranking > 0:
+            ranking_loss = depth_ranking_loss(depth, viewpoint_cam.depth.unsqueeze(0), 1e-4, dataset.box_s, dataset.n_corr)
+            loss += dataset.lambda_ranking * ranking_loss
+        if dataset.lambda_tv > 0:
+            tv_loss =  (torch.mean(torch.pow(depth[:, :, :-1] - depth[:, :, 1:], 2)) + torch.mean(torch.pow(depth[ :, :-1, :] - depth[ :, 1:, :], 2)))
+            loss += dataset.lambda_tv * tv_loss
         
-        if do_semantic:
-            image_resize = torch.nn.functional.interpolate(image.unsqueeze(0), (224, 224), mode='bicubic')
-            render_embed = embed(image_resize)[0][0] # N = 1, and get [CLS] token embedding
-            target_i = np.random.randint(0, target_embed.shape[0])
-            semantic_loss = -torch.cosine_similarity(render_embed, target_embed[target_i, 0], dim=-1)
-            loss = semantic_loss * dataset.lambda_semantic
         loss.backward()
         iter_end.record()
 
@@ -155,17 +153,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                losses = [depth_loss, smoothness_loss, ranking_loss, tv_loss]
+                names = ["Depth", "Smoothness", "Ranking", "TV"]
+                postfix_dict = {"EMA Loss": f"{ema_loss_for_log:.{7}f}",
+                                          "Total Loss": f"{loss:.{7}f}"}
+
+                for l,n in zip(losses, names):
+                    if l is not None:
+                        postfix_dict[n] = f"{l:.{7}f}"
+
+                
+                progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, semantic_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            #training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, ranking_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            if (iteration-30000) % dataset.prune_interval == 0:
+                prune_floaters(scene.getTrainCameras(), gaussians, pipe, background, dataset)
+                last_prune_iter = iteration
+                
+
+            if iteration - last_prune_iter == dataset.prune_dense_interval:
+                gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, 20)
+                print('Densifying')
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -174,7 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -187,6 +203,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
 
 def pearson_depth_loss(depth_src, depth_target, pearson):
     co = pearson(depth_src.reshape(-1), depth_target.reshape(-1))
@@ -202,31 +219,83 @@ def second_smoothness_loss(depth, img, laplacian, gradient):
             + depth_grad_xy.abs() + depth_grad_y2.abs())
         return x.mean()
 
+def pad_image(image, patch_size):
+    _, H, W = image.size()
+    # Calculate the padding needed to make the dimensions multiples of the patch size
+    pad_h = math.ceil(H / patch_size) * patch_size - H
+    pad_w = math.ceil(W / patch_size) * patch_size - W
+    # Apply zero padding to the image
+    padded_image = torch.nn.functional.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
+    return padded_image
 
+def split_image_into_patches(image, patch_size):
+    # Pad the image to make its dimensions multiples of the patch size
+    padded_image = pad_image(image, patch_size).squeeze()
 
-def depth_ranking_loss(depth_src, depth_target, margin):
-    # generate N random pairs of pixels within depth_src and depth_target
-    loss = 0
+    # Get the dimensions of the padded image
+    H, W = padded_image.size()
+
+    # Use the unfold function to split the padded image into patches
+    patches = padded_image.unfold(0, patch_size, patch_size).unfold(1, patch_size, patch_size)
+
+    # Reshape the patches to have the shape (num_patches_h, num_patches_w, patch_size, patch_size)
+    patches = patches.permute(0, 1, 2, 3).contiguous().view(-1, patch_size, patch_size).view(-1, patch_size*patch_size)
+
+    return patches
+
+def depth_ranking_loss(depth_src, depth_target, margin, box_s, n_corr):
+
+    src_pad = pad_image(depth_src, box_s).squeeze()
+    target_pad = pad_image(depth_target, box_s).squeeze()
     
-    ds_flat = 1/(1+depth_src.reshape(-1))
-    dt_flat = 1/(1+depth_target.reshape(-1))
+    #src_patch = split_image_into_patches(src_pad, box_s)
+    #targ_patch = split_image_into_patches(target_pad, box_s)
+    print(src_pad.shape)
+    H, W = src_pad.shape
 
-    idxs1 = torch.randperm(depth_src.shape[0])
-    idxs2 = torch.randperm(depth_src.shape[0])
+    (gridx, gridy) = torch.meshgrid(torch.arange(H), torch.arange(W))
+    gridx = split_image_into_patches(gridx, box_s)
+    gridy = split_image_into_patches(gridy, box_s)
 
-    ds_rand1 = ds_flat[idxs1]
-    ds_rand2 = ds_flat[idxs2]
+    loss = 0.0
+    idxs = torch.randint(box_s*box_s, size=(grid.shape[0], n_corr, 2))
+    src_rand1 = src_pad[grid[:,idxs[:,:,0]]]
+    src_rand2 = src_pad[grid[:,idxs[:,:,1]]]
 
-    dt_rand1 = dt_flat[idxs1]
-    dt_rand2 = dt_flat[idxs2]
+    target_rand1 = target_pad[grid[:,idxs[:,:,0]]]
+    target_rand2 = target_pad[grid[:,idxs[:,:,1]]]
 
-    mask = ds_rand1 > ds_rand2 # get mask of pairs that are higher in first coordinate
-    loss += torch.sum(torch.clamp(margin + dt_rand2 - dt_rand1, min=0.0) * (1.0 - mask.float()))
-    loss += torch.sum(torch.clamp(margin + dt_rand1 - dt_rand2, min=0.0) * (mask.float()))
-
-    return loss
+    mask = target_rand1 > target_rand2 # get mask of pairs that are higher in first coordinate
+    loss += torch.mean(torch.clamp(margin + src_rand2 - src_rand1, min=0.0)[mask])
+    loss += torch.mean(torch.clamp(margin + src_rand1 - src_rand2, min=0.0)[~mask])
+    return loss.mean()
     
+def prune_floaters(viewpoint_stack, gaussians, pipe, background, dataset):
+     with torch.no_grad():
+        N = gaussians.get_opacity.shape[0]
+        mask = torch.zeros(N, dtype=torch.bool, device="cuda")
+        for view in viewpoint_stack:       
+            render_pkg = render(view, gaussians, pipe, background)
+            image, viewspace_point_tensor, visibility_filter, radii, depth, mode_id, modes = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["mode_id"], render_pkg["modes"]
+            # Loss
 
+            
+            #gt_image = viewpoint_cam.original_image.cuda()
+            #Ll1 = l1_loss(image, gt_image)
+            #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            
+            submask = torch.zeros_like(mask)
+            pruned_modes_mask = normalize(modes) < dataset.prune_thresh
+            print(pruned_modes_mask)
+            prune_mode_ids = mode_id[pruned_modes_mask].view(-1)
+            print(prune_mode_ids)
+            submask[prune_mode_ids.long()] = True
+            mask = mask | submask
+
+        num_points_pruned = mask.sum()
+        print(f'Pruning {num_points_pruned} gaussians')
+    #gaussians.prune_points(mask) #mask is P X 1
+        gaussians.prune_points(mask)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -251,14 +320,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, semantic_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, ranking_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         if depth_loss is not None:
             tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
         if smoothness_loss is not None:
             tb_writer.add_scalar('train_loss_patches/smoothness_loss', smoothness_loss.item(), iteration)
-        if semantic_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/semantic_loss', semantic_loss.item(), iteration)
+        if ranking_loss is not None:
+            tb_writer.add_scalar('train_loss_patches/ranking_loss', ranking_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
@@ -320,7 +389,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    #network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.step, args.max_cameras)
 

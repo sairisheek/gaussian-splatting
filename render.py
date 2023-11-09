@@ -16,12 +16,13 @@ from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
 import torchvision
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, normalize
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 import numpy as np
 import matplotlib.pyplot as plt
+import cv2
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -29,12 +30,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
     num_gauss_path = os.path.join(model_path, name, "ours_{}".format(iteration), "num_gauss")
     accum_alpha_path = os.path.join(model_path, name, "ours_{}".format(iteration), "accum_alpha")
+    modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "modes")
+    pruned_modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "pruned_modes")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
     makedirs(num_gauss_path, exist_ok=True)
     makedirs(accum_alpha_path, exist_ok=True)
+    makedirs(modes_path, exist_ok=True)
+    makedirs(pruned_modes_path, exist_ok=True)
 
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -48,12 +53,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         #print(results["num_gauss"].mean(dtype=torch.float32))
         depth[(depth < 0)] = 0
         depth = (depth / (depth.max() + 1e-5)).detach().cpu().numpy().squeeze()
+        modes = normalize(results["modes"])
+        pruned_modes = modes < 0.02
         #depth = (depth * 255).astype(np.uint8)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         plt.imsave(os.path.join(num_gauss_path, '{0:05d}'.format(idx) + ".png"), num_gauss.cpu().numpy().squeeze())
-        plt.imsave(os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"), depth, cmap='jet')
+        plt.imsave(os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"), depth, cmap='jet')        
         plt.imsave(os.path.join(accum_alpha_path, '{0:05d}'.format(idx) + ".png"), accum_alpha.cpu().numpy().squeeze())
+        #plt.imsave(os.path.join(modes_path, '{0:05d}'.format(idx) + ".png"), modes.cpu().numpy().squeeze())
+        #write mode as 16 bit png
+        cv2.imwrite(os.path.join(modes_path, view.image_name + ".png"), (modes.cpu().numpy().squeeze() * 65535).astype(np.uint16))
+        plt.imsave(os.path.join(pruned_modes_path, '{0:05d}'.format(idx) + ".png"), pruned_modes.cpu().numpy().squeeze())
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

@@ -56,8 +56,13 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.lambda_depth = 0.0
         self.lambda_smoothness = 0.0
-        self.lambda_semantic = 0.0
-        self.semantic_loss_interval = 1
+        self.lambda_ranking = 0.0
+        self.lambda_tv = 0.0
+        self.prune_thresh = 0.0
+        self.prune_interval = 1000
+        self.prune_dense_interval = 500
+        self.box_s = 300
+        self.n_corr = 5000
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -71,6 +76,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.beta = 0.0
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
