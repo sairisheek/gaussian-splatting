@@ -40,8 +40,10 @@ def loadCam(args, id, cam_info, resolution_scale):
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-    resized_depth = NP_resize(cam_info.depth, resolution)
-    resized_depth = (resized_depth - resized_depth.min())/(resized_depth.max() - resized_depth.min())
+    resized_depth = None
+    if cam_info.depth is not None:
+        resized_depth = NP_resize(cam_info.depth, resolution)
+        resized_depth = torch.Tensor((resized_depth - resized_depth.min())/(resized_depth.max() - resized_depth.min())).cuda()
 
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None

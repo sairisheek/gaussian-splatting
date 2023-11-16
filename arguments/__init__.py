@@ -39,7 +39,11 @@ class ParamGroup:
 
     def extract(self, args):
         group = GroupParams()
-        for arg in vars(args).items():
+        d = vars(args)
+        if 'no_load_depth' not in d:
+            d['no_load_depth'] = False
+
+        for arg in d.items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])
         return group
@@ -53,16 +57,22 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        self.no_load_depth = False
         self.eval = False
-        self.lambda_depth = 0.0
-        self.lambda_smoothness = 0.0
-        self.lambda_ranking = 0.0
-        self.lambda_tv = 0.0
-        self.prune_thresh = 0.0
-        self.prune_interval = 1000
-        self.prune_dense_interval = 500
-        self.box_s = 300
-        self.n_corr = 5000
+        self.lambda_local_pearson = 0.0
+        self.box_p = 128
+        self.p_corr = 0.5
+       
+        self.densify_lag = 500000
+
+        self.power_thresh = -4.0
+        self.densify_period = 5000
+
+        #Diffusion Params
+        self.step_ratio = 0.95
+        self.lambda_diffusion = 0.0
+     
+        
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -97,6 +107,7 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+    
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

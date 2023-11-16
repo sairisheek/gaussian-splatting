@@ -28,48 +28,60 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
-    num_gauss_path = os.path.join(model_path, name, "ours_{}".format(iteration), "num_gauss")
-    accum_alpha_path = os.path.join(model_path, name, "ours_{}".format(iteration), "accum_alpha")
+    #num_gauss_path = os.path.join(model_path, name, "ours_{}".format(iteration), "num_gauss")
+    #accum_alpha_path = os.path.join(model_path, name, "ours_{}".format(iteration), "accum_alpha")
     modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "modes")
-    pruned_modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "pruned_modes")
+    #var_path = os.path.join(model_path, name, "ours_{}".format(iteration), "var")
+    #raw_modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "raw_modes")
+    #raw_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "raw_depth")
+    #monodepth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "monodepth")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
-    makedirs(num_gauss_path, exist_ok=True)
-    makedirs(accum_alpha_path, exist_ok=True)
+    #makedirs(num_gauss_path, exist_ok=True)
+    #makedirs(accum_alpha_path, exist_ok=True)
     makedirs(modes_path, exist_ok=True)
-    makedirs(pruned_modes_path, exist_ok=True)
-
-
+    #makedirs(var_path, exist_ok=True)
+    #makedirs(raw_modes_path, exist_ok=True)
+    #makedirs(raw_depth_path, exist_ok=True)
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        print(view, view.image_name)
         results = render(view, gaussians, pipeline, background)
         rendering = results["render"]
+        #loss = (results["render"] - results["render"].detach()).sum()
+        #loss.backward()
+
+        #var = normalize(results["var_loss"].grad)
         gt = view.original_image[0:3, :, :]
         depth = results["depth"]
-        num_gauss = (results["num_gauss"])/results["num_gauss"].max()
-        accum_alpha = results["accum_alpha"]
+  
+        #num_gauss = (results["num_gauss"])/results["num_gauss"].max()
+        #accum_alpha = results["accum_alpha"]
         #print(accum_alpha.max())
         #print(results["num_gauss"].mean(dtype=torch.float32))
         depth[(depth < 0)] = 0
+        #np.save(os.path.join(raw_depth_path, view.image_name + ".npy"), depth.detach().cpu().numpy().squeeze())
+        #np.save(os.path.join(raw_modes_path, view.image_name + ".npy"), results["modes"].detach().cpu().numpy().squeeze())
         depth = (depth / (depth.max() + 1e-5)).detach().cpu().numpy().squeeze()
         modes = normalize(results["modes"])
-        pruned_modes = modes < 0.02
         #depth = (depth * 255).astype(np.uint8)
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        plt.imsave(os.path.join(num_gauss_path, '{0:05d}'.format(idx) + ".png"), num_gauss.cpu().numpy().squeeze())
-        plt.imsave(os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"), depth, cmap='jet')        
-        plt.imsave(os.path.join(accum_alpha_path, '{0:05d}'.format(idx) + ".png"), accum_alpha.cpu().numpy().squeeze())
+        torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
+        #plt.imsave(os.path.join(num_gauss_path, view.image_name + ".png"), num_gauss.cpu().numpy().squeeze())
+        plt.imsave(os.path.join(depth_path, view.image_name + ".png"), depth, cmap='jet')  
+        #cv2.imwrite(os.path.join(depth_path, view.image_name + ".png"), (depth * 65535).astype(np.uint16))      
+        #plt.imsave(os.path.join(accum_alpha_path, view.image_name + ".png"), accum_alpha.detach().cpu().numpy().squeeze())
         #plt.imsave(os.path.join(modes_path, '{0:05d}'.format(idx) + ".png"), modes.cpu().numpy().squeeze())
         #write mode as 16 bit png
-        cv2.imwrite(os.path.join(modes_path, view.image_name + ".png"), (modes.cpu().numpy().squeeze() * 65535).astype(np.uint16))
-        plt.imsave(os.path.join(pruned_modes_path, '{0:05d}'.format(idx) + ".png"), pruned_modes.cpu().numpy().squeeze())
+        cv2.imwrite(os.path.join(modes_path, view.image_name + ".png"), (modes.detach().cpu().numpy().squeeze() * 65535).astype(np.uint16))
+        #cv2.imwrite(os.path.join(var_path, view.image_name + ".png"), (var.detach().cpu().numpy().squeeze() * 65535).astype(np.uint16))
+        #plt.imsave(os.path.join(var_path, view.image_name + ".png"), var.detach().cpu().numpy().squeeze(), cmap='jet')
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, mode='eval')
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

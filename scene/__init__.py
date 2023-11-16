@@ -8,7 +8,8 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import numpy as np
+from scene.generate_new_cam import rotate_camera_poses, calculate_average_up_vector, create_cam_obj
 import os
 import random
 import json
@@ -24,7 +25,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], step=1, max_cameras=None):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], step=1, max_cameras=None, mode='train'):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -41,10 +42,10 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
-        self.holdout_cameras = {}
+        self.ft_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, step=step, max_cameras=max_cameras)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, step=step, max_cameras=max_cameras, load_depth=(not args.no_load_depth))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -77,8 +78,30 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
-            print("Loading Holdout Cameras")
-            self.holdout_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.hold_cameras, resolution_scale, args)
+            if mode != 'eval':
+            # # Rotate around average up vector
+                train_cam_list = self.train_cameras[resolution_scale]
+                num_poses = len(train_cam_list)
+                R_list = list()
+                T_list = list()
+                for cam in train_cam_list:
+                    R_list.append(cam.R)
+                    T_list.append(cam.T)
+                R_matrices = np.stack(R_list)
+                T_vectors = np.stack(T_list)
+                avg_up_vector = calculate_average_up_vector(R_matrices)
+                novel_cam_append_list = list()
+                for d in [-10.0, -5.0, 5.0, 10.0]:
+                    degree = d
+                    new_R_matrices, new_T_vectors = rotate_camera_poses(avg_up_vector, R_matrices,
+                                                                        T_vectors, degree * np.pi / 180)
+                    for idx in range(num_poses):
+                        train_cam = train_cam_list[idx]
+                        novel_cam_append_list.append(create_cam_obj(train_cam,degree,
+                                                                    new_R_matrices[idx,:,:],new_T_vectors[idx,:]))
+                self.ft_cameras[resolution_scale] = novel_cam_append_list
+
+
         
         cam_centers = [x.camera_center for x in self.train_cameras[1.0]]
         cam_centers = torch.stack(cam_centers)
@@ -93,7 +116,7 @@ class Scene:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+        point_cloud_path = os.path.join(self.model_path, f"point_cloud/iteration_{iteration}")
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
@@ -102,5 +125,5 @@ class Scene:
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
     
-    def getHoldoutCameras(self, scale=1.0):
-        return self.holdout_cameras[scale]
+    def getFtCameras(self, scale=1.0):
+        return self.ft_cameras[scale]

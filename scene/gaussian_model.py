@@ -276,6 +276,10 @@ class GaussianModel:
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
+    
+    def move_points(self, new_xyz):
+        optimizable_tensors = self.replace_tensor_to_optimizer(new_xyz, "xyz")
+        self._xyz = optimizable_tensors["xyz"]
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}

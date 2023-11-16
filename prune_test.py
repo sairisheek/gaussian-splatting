@@ -15,11 +15,14 @@ import torch
 from torchmetrics import PearsonCorrCoef
 from kornia.losses import inverse_depth_smoothness_loss
 import math
+import sys
 
 from icecream import ic
 import clip_utils
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim, LaplacianLayer, Sobel
+from utils.loss_utils import l1_loss, l2_loss, ssim
+import cv2
+import matplotlib.pyplot as plt
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -55,12 +58,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = scene.getTrainCameras().copy() 
     ema_loss_for_log = 0.0
-    
-    
+
+    #fig = plt.figure()
+    #ax = fig.add_subplot(111, projection='3d')
+    cam_dirs = []
+    cam_poses = []
+    for cam in viewpoint_stack:
+        cam_dir = cam.R
+        cam_pos = cam.T
+        cam_dirs.append(cam_dir)
+        cam_poses.append(cam_pos)
+
+    #save cam_dirs and poses
+    np.save("cam_dirs.npy", np.array(cam_dirs))
+    np.save("cam_poses.npy", np.array(cam_poses))
+    #ax.quiver(cam_pos[0], cam_pos[1], cam_pos[2], cam_dir[0], cam_dir[1], cam_dir[2], length=0.1, normalize=True)
+    #ax.set_xlabel('X')
+    #ax.set_ylabel('Y')
+    #ax.set_zlabel('Z')
+    #ax.set_title('Camera Poses')
+
+    plt.show()
+
+    sys.exit()
     with torch.no_grad():
         N = gaussians.get_opacity.shape[0]
         mask = torch.zeros(N, dtype=torch.bool, device="cuda")
-        for view in viewpoint_stack:       
+        for idx, view in enumerate(viewpoint_stack):
             render_pkg = render(view, gaussians, pipe, background)
             image, viewspace_point_tensor, visibility_filter, radii, depth, mode_id, modes, point_list = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["mode_id"], render_pkg["modes"], render_pkg["point_list"]
             # Loss
@@ -69,9 +93,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #Ll1 = l1_loss(image, gt_image)
             #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             
+            norm_modes = normalize(modes)
+
             submask = torch.zeros_like(mask)
-            pruned_modes_mask = normalize(modes) < dataset.prune_thresh # select points less than threshold
-            prune_mode_ids = mode_id[:,pruned_modes_mask.squeeze()] # subselect the mode idxs
+            pruned_modes_mask = get_mode_mask(modes).cpu().squeeze()#normalize(modes) < dataset.prune_thresh # select points less than threshold
+            cv2.imwrite(f"output/prune_debugging_folder/{view.image_name}.png", (norm_modes.cpu().numpy().squeeze() * 255).astype(np.uint8))
+            cv2.imwrite(f"output/prune_debugging_folder/{view.image_name}_masked.png", pruned_modes_mask.numpy() * 255)
+
+            prune_mode_ids = mode_id[:,pruned_modes_mask.bool().squeeze()] # subselect the mode idxs
             neg_mask = (prune_mode_ids == -1).any(dim=0)
             prune_mode_ids = prune_mode_ids[:,~neg_mask]
             selected_gaussians = set()
@@ -83,10 +112,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         num_points_pruned = mask.sum()
         print(f'Pruning {num_points_pruned} gaussians')
     #gaussians.prune_points(mask) #mask is P X 1
-        gaussians.mark_red(mask)
+        gaussians.prune_points(mask)
         #gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
 
-        scene.save(8888)
+        scene.save(7000)
        
 
        
@@ -228,6 +257,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smooth
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+
+# if __name__ == "__main__":
+#     from PIL import Image
+#     dir = "output/bonsai_0/modes/"
+
+#     for file in os.listdir(dir):
+#         depth_img = np.array(Image.open(os.path.join(dir, file)))
+
+
 
 if __name__ == "__main__":
     # Set up command line argument parser

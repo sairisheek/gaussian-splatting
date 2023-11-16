@@ -9,47 +9,41 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+
 import os
 import numpy as np
 import torch
-from torchmetrics import PearsonCorrCoef
-from kornia.losses import inverse_depth_smoothness_loss
+import torch.nn.functional as F
 import math
-
+import cv2
+import diptest
 from icecream import ic
-import clip_utils
+from guidance.sd_utils import StableDiffusion
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim, LaplacianLayer, Sobel
+from utils.loss_utils import l1_loss, l2_loss, ssim, local_pearson_loss
+from utils.prune_utils import calc_diff
+from scipy import stats
+import matplotlib.pyplot as plt
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, normalize
+import time
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-
+os.environ['QT_QPA_PLATFORM']='offscreen'
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def setup_clip(cams):
-    with torch.no_grad():
-        clip_utils.load_vit(root = os.path.expanduser("~/.cache/clip"))
-        embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=-1)
-        targets = torch.stack([x.original_image for x in cams], dim=0)
-        targets = torch.nn.functional.interpolate(targets, (224, 224), mode='bicubic')
-        targets.requires_grad = False
-        target_embed = embed(targets)
-    return embed, target_embed
+    
 
-
-
-
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras, prune_sched):
    
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -73,11 +67,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    last_prune_iter = None
+    print(prune_sched)
 
-    pearson = PearsonCorrCoef().to('cuda')
-    #laplacian = LaplacianLayer().to('cuda')
-    #gradient = Sobel().to('cuda')
-    last_prune_iter = 0
+
+    guidance_sd = StableDiffusion(device="cuda")
+    guidance_sd.get_text_embeds([""], [""])
+    print(f"[INFO] loaded SD!")
+    novel_cam_stack = None
+
+
     for iteration in range(first_iter, opt.iterations + 1):        
         '''    
         if network_gui.conn == None:
@@ -109,13 +108,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        
+        any_loss_on_novel_cam = dataset.lambda_diffusion > 0 
+        pick_novel_cam = ((randint(1, 10) <=2) and (iteration > int(opt.iterations*2/3)) and any_loss_on_novel_cam)
 
+        if pick_novel_cam: # A novel cam is picked
+            if not novel_cam_stack:
+                novel_cam_stack = scene.getFtCameras().copy()
+            novel_cam = novel_cam_stack.pop(randint(0, len(novel_cam_stack)-1))
+            novel_render_pkg = render(novel_cam, gaussians, pipe, background)
+            novel_image = novel_render_pkg["render"]
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
-
+     
         # Loss
 
          
@@ -123,38 +131,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
        
-
-        smoothness_loss = None
-        depth_loss = None
-        semantic_loss = None
-        ranking_loss = None
-        tv_loss = None
-        #gt_depth = (viewpoint_cam.depth - viewpoint_cam.depth.min())/ (viewpoint_cam.depth.max() - viewpoint_cam.depth.min())
-
-        if dataset.lambda_depth > 0:
-            depth_loss = pearson_depth_loss(depth, viewpoint_cam.depth, pearson)
-            #depth_loss = depth_ranking_loss(gt_depth, depth, 1e-4)/10_000
-            loss += dataset.lambda_depth*depth_loss 
-        if dataset.lambda_smoothness > 0:
-            #smoothness_loss = second_smoothness_loss(depth, image, laplacian, gradient)
-            smoothness_loss = inverse_depth_smoothness_loss(depth.unsqueeze(0), image.unsqueeze(0))
-            loss += dataset.lambda_smoothness * smoothness_loss
-        if dataset.lambda_ranking > 0:
-            ranking_loss = depth_ranking_loss(depth, viewpoint_cam.depth.unsqueeze(0), 1e-4, dataset.box_s, dataset.n_corr)
-            loss += dataset.lambda_ranking * ranking_loss
-        if dataset.lambda_tv > 0:
-            tv_loss =  (torch.mean(torch.pow(depth[:, :, :-1] - depth[:, :, 1:], 2)) + torch.mean(torch.pow(depth[ :, :-1, :] - depth[ :, 1:, :], 2)))
-            loss += dataset.lambda_tv * tv_loss
+        diffusion_loss = None
+        lp_loss = None
         
+        if dataset.lambda_local_pearson > 0:
+            lp_loss = local_pearson_loss(depth.squeeze(0), viewpoint_cam.depth, dataset.box_p, dataset.p_corr)
+            loss += dataset.lambda_local_pearson * lp_loss
+        
+        if dataset.lambda_diffusion > 0 and pick_novel_cam:
+            diffusion_loss = guidance_sd.train_step(novel_image.unsqueeze(0), dataset.step_ratio)
+            loss += dataset.lambda_diffusion * diffusion_loss
+
         loss.backward()
         iter_end.record()
+        densify_start = None
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            losses = [lp_loss, diffusion_loss]
+            names = [ "Local_Depth", "Diffusion"]
             if iteration % 10 == 0:
-                losses = [depth_loss, smoothness_loss, ranking_loss, tv_loss]
-                names = ["Depth", "Smoothness", "Ranking", "TV"]
+                
                 postfix_dict = {"EMA Loss": f"{ema_loss_for_log:.{7}f}",
                                           "Total Loss": f"{loss:.{7}f}"}
 
@@ -169,19 +167,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            #training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, ranking_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            tr_dict = {names[i]: losses[i] for i in range(len(losses))}
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, tr_dict,  iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            if (iteration-30000) % dataset.prune_interval == 0:
-                prune_floaters(scene.getTrainCameras(), gaussians, pipe, background, dataset)
-                last_prune_iter = iteration
-                
-
-            if iteration - last_prune_iter == dataset.prune_dense_interval:
-                gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, 20)
-                print('Densifying')
+          
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -199,104 +191,187 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-
+            
+            if iteration in prune_sched:
+                os.makedirs(os.path.join(dataset.model_path, f"pruned_modes_mask_{iteration}"), exist_ok=True)
+                os.makedirs(os.path.join(dataset.model_path, f"modes_{iteration}"), exist_ok=True)
+                scene.save(iteration-1)
+                prune_floaters(scene.getTrainCameras().copy(), gaussians, pipe, background, dataset, iteration)
+                scene.save(iteration+1)
+                last_prune_iter = iteration
+            
+            if last_prune_iter is not None and not (iteration == last_prune_iter) and iteration - last_prune_iter > dataset.densify_lag and iteration - last_prune_iter < dataset.densify_period + dataset.densify_lag and iteration % 100 == 0:                
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.densify_and_prune(opt.densify_grad_threshold, 0.01, scene.cameras_extent, 20)
+                print('Densifying')
+                
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-            
 
-def pearson_depth_loss(depth_src, depth_target, pearson):
-    co = pearson(depth_src.reshape(-1), depth_target.reshape(-1))
-    return 1 - co
+#pixel_thresh is the stopping criteria, or lower bound of how many pixels we want to prune, if lower then stop bc we dont have much more to prune
+#thresh_bin  is the upper bound so that we dont prune too much at once
+#prune_stop is how far we want to prune from the initial number of pixels pruned 
+# 
 
-def second_smoothness_loss(depth, img, laplacian, gradient):
-        img_lap = laplacian(img.unsqueeze(0), do_normalize=False)
-        depth_grad_x, depth_grad_y = torch.tensor_split(gradient(depth.unsqueeze(0)), 2, dim=1)
-        depth_grad_x2, depth_grad_xy = torch.tensor_split(gradient(depth_grad_x), 2, dim=1)
-        depth_grad_yx, depth_grad_y2 = torch.tensor_split(gradient(depth_grad_y), 2, dim=1)
-        
-        x = torch.exp(-img_lap) * (depth_grad_x2.abs() \
-            + depth_grad_xy.abs() + depth_grad_y2.abs())
-        return x.mean()
+def calc_alpha(means2D, conic_opac, x, y):
+    dx = x - means2D[:,0]
+    dy = y - means2D[:,1]
+    #print(dx.max())
+    #print(dy.max())
+    #print("dx",  dx)
+    power = -0.5*(conic_opac[:,0]*(dx*dx) + conic_opac[:,2]*(dy*dy)) - conic_opac[:,1]*dx*dy
+    #print(power)
+    alpha = power
+    alpha[power > 0] = -100
+    return alpha
 
-def pad_image(image, patch_size):
-    _, H, W = image.size()
-    # Calculate the padding needed to make the dimensions multiples of the patch size
-    pad_h = math.ceil(H / patch_size) * patch_size - H
-    pad_w = math.ceil(W / patch_size) * patch_size - W
-    # Apply zero padding to the image
-    padded_image = torch.nn.functional.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
-    return padded_image
-
-def split_image_into_patches(image, patch_size):
-    # Pad the image to make its dimensions multiples of the patch size
-    padded_image = pad_image(image, patch_size).squeeze()
-
-    # Get the dimensions of the padded image
-    H, W = padded_image.size()
-
-    # Use the unfold function to split the padded image into patches
-    patches = padded_image.unfold(0, patch_size, patch_size).unfold(1, patch_size, patch_size)
-
-    # Reshape the patches to have the shape (num_patches_h, num_patches_w, patch_size, patch_size)
-    patches = patches.permute(0, 1, 2, 3).contiguous().view(-1, patch_size, patch_size).view(-1, patch_size*patch_size)
-
-    return patches
-
-def depth_ranking_loss(depth_src, depth_target, margin, box_s, n_corr):
-
-    src_pad = pad_image(depth_src, box_s).squeeze()
-    target_pad = pad_image(depth_target, box_s).squeeze()
-    
-    #src_patch = split_image_into_patches(src_pad, box_s)
-    #targ_patch = split_image_into_patches(target_pad, box_s)
-    print(src_pad.shape)
-    H, W = src_pad.shape
-
-    (gridx, gridy) = torch.meshgrid(torch.arange(H), torch.arange(W))
-    gridx = split_image_into_patches(gridx, box_s)
-    gridy = split_image_into_patches(gridy, box_s)
-
-    loss = 0.0
-    idxs = torch.randint(box_s*box_s, size=(grid.shape[0], n_corr, 2))
-    src_rand1 = src_pad[grid[:,idxs[:,:,0]]]
-    src_rand2 = src_pad[grid[:,idxs[:,:,1]]]
-
-    target_rand1 = target_pad[grid[:,idxs[:,:,0]]]
-    target_rand2 = target_pad[grid[:,idxs[:,:,1]]]
-
-    mask = target_rand1 > target_rand2 # get mask of pairs that are higher in first coordinate
-    loss += torch.mean(torch.clamp(margin + src_rand2 - src_rand1, min=0.0)[mask])
-    loss += torch.mean(torch.clamp(margin + src_rand1 - src_rand2, min=0.0)[~mask])
-    return loss.mean()
-    
-def prune_floaters(viewpoint_stack, gaussians, pipe, background, dataset):
+def prune_floaters(viewpoint_stack, gaussians, pipe, background, dataset, iteration):
      with torch.no_grad():
         N = gaussians.get_opacity.shape[0]
-        mask = torch.zeros(N, dtype=torch.bool, device="cuda")
-        for view in viewpoint_stack:       
-            render_pkg = render(view, gaussians, pipe, background)
-            image, viewspace_point_tensor, visibility_filter, radii, depth, mode_id, modes = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["mode_id"], render_pkg["modes"]
-            # Loss
+        ctrs = [0]*len(viewpoint_stack)
 
+        num_pixels_init = [None]*len(viewpoint_stack)
+        #mask = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        os.makedirs(os.path.join(dataset.model_path, f"pruned_modes_mask_{iteration}"), exist_ok=True)
+        os.makedirs(os.path.join(dataset.model_path, f"modes_{iteration}"), exist_ok=True)
+        os.makedirs(os.path.join(dataset.model_path, f"depth_{iteration}"), exist_ok=True)
+        os.makedirs(os.path.join(dataset.model_path, f"diff_{iteration}"), exist_ok=True)
+
+
+        mask = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+
+        plt.figure(figsize=(25,20))
+        
+        dips = []        
+        point_lists = []
+        means2Ds = []
+        conic_opacities = []
+        mode_ids = []
+        diffs = []
+        names = []
+        for view in viewpoint_stack:
+            names.append(view.image_name)
+            render_pkg = render(view, gaussians, pipe, background, ret_pts=True)
+            mode_id, mode, point_list, depth, means2D, conic_opacity = render_pkg["mode_id"], render_pkg["modes"], render_pkg["point_list"], render_pkg["depth"], render_pkg["means2D"], render_pkg["conic_opacity"] 
+            diff = calc_diff(mode, depth)
+            plt.imsave(os.path.join(dataset.model_path, f"modes_{iteration}", f"{view.image_name}.png" ), mode.cpu().numpy().squeeze(), cmap='jet')
+            plt.imsave(os.path.join(dataset.model_path, f"depth_{iteration}", f"{view.image_name}.png" ), depth.cpu().numpy().squeeze(), cmap='jet')
+            point_lists.append(point_list)
+            means2Ds.append(means2D)
+            conic_opacities.append(conic_opacity)
+            mode_ids.append(mode_id)
+            diffs.append(diff)
+            dips.append(diptest.dipstat(diff[diff > 0].cpu().numpy()))
+
+        dips = np.array(dips)
+        avg_dip = dips.mean()
+        perc = 97*np.exp(-8*avg_dip)
+
+        if (perc < 80):
+            perc = 80
+        print(f'Percentile {perc}')
+
+        for name, mode_id, point_list, diff, means2D, conic_opacity in zip(names, mode_ids, point_lists, diffs, means2Ds, conic_opacities):
+            submask = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+           
+            diffpos = diff[diff > 0]
+            threshold = np.percentile(diffpos.cpu().numpy(), perc)
+            pruned_modes_mask = (diff > threshold).squeeze()
+            cv2.imwrite(os.path.join(dataset.model_path, f"pruned_modes_mask_{iteration}",f"{name}.png"), pruned_modes_mask.cpu().numpy().squeeze().astype(np.uint8)*255)
+
+            pixel_y, pixel_x = torch.meshgrid(torch.arange(pruned_modes_mask.shape[0]), torch.arange(pruned_modes_mask.shape[1]), indexing='ij')
+            prune_mode_ids = mode_id[:,pruned_modes_mask] # subselect the mode idxs
+            pixel_x = pixel_x[pruned_modes_mask]
+            pixel_y = pixel_y[pruned_modes_mask]
+
+            neg_mask = (prune_mode_ids == -1).any(dim=0)
+            prune_mode_ids = prune_mode_ids[:,~neg_mask]
+            pixel_x = pixel_x[~neg_mask]
+            pixel_y = pixel_y[~neg_mask]
+
+            selected_gaussians = set()
+            for j in range(prune_mode_ids.shape[-1]):
+                x = pixel_x[j]
+                y = pixel_y[j]
+                gausses = point_list[prune_mode_ids[0,j]:prune_mode_ids[1,j]+1].long()
+                c_opacs = conic_opacity[gausses]
+                m2Ds = means2D[gausses]
+                test_alpha = calc_alpha(m2Ds, c_opacs, x, y)
+ 
+                alpha_mask = test_alpha > dataset.power_thresh
+      
+                gausses = gausses[alpha_mask]
+       
+                selected_gaussians.update(gausses.tolist())
+      
+            submask[list(selected_gaussians)] = True
             
-            #gt_image = viewpoint_cam.original_image.cuda()
-            #Ll1 = l1_loss(image, gt_image)
-            #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            
-            submask = torch.zeros_like(mask)
-            pruned_modes_mask = normalize(modes) < dataset.prune_thresh
-            print(pruned_modes_mask)
-            prune_mode_ids = mode_id[pruned_modes_mask].view(-1)
-            print(prune_mode_ids)
-            submask[prune_mode_ids.long()] = True
+            print(f"submask {torch.count_nonzero(submask)}")
+
             mask = mask | submask
 
-        num_points_pruned = mask.sum()
-        print(f'Pruning {num_points_pruned} gaussians')
-    #gaussians.prune_points(mask) #mask is P X 1
-        gaussians.prune_points(mask)
+            num_points_pruned = submask.sum()
+            print(f'Pruning {num_points_pruned} gaussians')
 
+        print(gaussians.get_xyz.shape[0])
+        gaussians.prune_points(mask)
+        print(gaussians.get_xyz.shape[0])
+        
+    
+
+    #gaussians.prune_points(mask) #mask is P X 1
+
+
+# def move_floaters(viewpoint_stack, gaussians, pipe, background, dataset, iteration):
+#     with torch.no_grad():
+#         os.makedirs(os.path.join(dataset.model_path, f"pruned_modes_mask_{iteration}"), exist_ok=True)
+#         os.makedirs(os.path.join(dataset.model_path, f"modes_{iteration}"), exist_ok=True)        
+#         for i,view in enumerate(viewpoint_stack):
+#             w2c = view.world_view_transform
+#             c2w = torch.inverse(w2c.transpose(0,1)).transpose(0,1)
+#             render_pkg = render(view, gaussians, pipe, background, ret_pts=True)
+#             mode_id, modes, point_list, depth = render_pkg["mode_id"], render_pkg["modes"], render_pkg["point_list"].long(), render_pkg["depth"]
+#             pruned_modes_mask = identify_floaters(modes, depth, percentile=dataset.prune_percentile).squeeze()
+#             prune_depth = depth.squeeze()[pruned_modes_mask]
+#             prune_mode_ids = mode_id[:,pruned_modes_mask] # subselect the mode idxs
+#             neg_mask = (prune_mode_ids == -1).any(dim=0)
+#             prune_mode_ids = prune_mode_ids[:,~neg_mask]
+#             prune_depth = prune_depth[~neg_mask]
+
+#             gauss_new_depth = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.float32, device="cuda")
+#             gauss_num_points = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.int, device="cuda")
+#             for j in range(prune_mode_ids.shape[-1]):
+#                 idxs = point_list[prune_mode_ids[0,j]:prune_mode_ids[1,j]+1]
+#                 gauss_new_depth[idxs] += prune_depth[j]
+#                 gauss_num_points[idxs] += 1
+
+#             gauss_nchange_mask = gauss_num_points == 0
+#             gauss_num_points[gauss_nchange_mask] = 1
+#             gauss_new_depth /= gauss_num_points
+#             N = (~gauss_nchange_mask).sum()
+#             print('Moving {} gaussians'.format(N))
+
+#             print('g_newdepth',gauss_new_depth[~gauss_nchange_mask])
+#             xyz_cam = torch.matmul(torch.cat((gaussians.get_xyz[~gauss_nchange_mask], torch.ones((N, 1), device="cuda")), dim=1), w2c)
+#             xyz_cam = (xyz_cam / xyz_cam[:,3].unsqueeze(1))[:,:3]
+#             print('xyz_cam',xyz_cam[:,2])
+
+#             xyz_cam[:,2] = gauss_new_depth[~gauss_nchange_mask]
+#             new_xyz_sub = torch.matmul(torch.cat((xyz_cam, torch.ones((N, 1), device="cuda")), dim=1), c2w)
+#             new_xyz_sub = (new_xyz_sub / new_xyz_sub[:,3].unsqueeze(1))[:,:3]
+#             new_xyz_sub = new_xyz_sub[:,:3]
+
+#             new_xyz = gaussians.get_xyz.clone()
+#             new_xyz[~gauss_nchange_mask] = new_xyz_sub
+#             gaussians.move_points(new_xyz)
+
+
+
+
+
+        
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -320,14 +395,11 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, depth_loss, smoothness_loss, ranking_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, tr_dict, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        if depth_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
-        if smoothness_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/smoothness_loss', smoothness_loss.item(), iteration)
-        if ranking_loss is not None:
-            tb_writer.add_scalar('train_loss_patches/ranking_loss', ranking_loss.item(), iteration)
+        for k,v in tr_dict.items():
+            if v is not None:
+                tb_writer.add_scalar('train_loss_patches/' + k, v.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
@@ -380,18 +452,20 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--max_cameras", type=int, default=None)
+    parser.add_argument("--prune_sched", nargs="+", type=int, default=[])
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
-    print("Optimizing " + args.model_path)
 
+    dataset = lp.extract(args)
+    
+    print("Optimizing " + dataset.model_path)
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.step, args.max_cameras)
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.step, args.max_cameras, args.prune_sched)
 
     # All done
     print("\nTraining complete.")

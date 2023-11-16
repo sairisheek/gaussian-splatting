@@ -13,39 +13,14 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from guidance.sd_utils import StableDiffusion
+import math
+from torchmetrics import PearsonCorrCoef
 
 import torch.nn as nn
 
-class LaplacianLayer(nn.Module):
-    def __init__(self):
-        super(LaplacianLayer, self).__init__()
-        self.filter = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding='same', padding_mode='replicate', bias=False)
 
-        w_nom = torch.FloatTensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]).unsqueeze(0).unsqueeze(0).expand(1,3,3,3)
-        self.filter.weight = nn.Parameter(w_nom, requires_grad=False)
-
-        #w_den = torch.FloatTensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]).view(1,1,3,3)
-        #w_nom.requires_grad = False
-        #w_den.requires_grad = False
-    
-
-    def forward(self, input, do_normalize=True):
-        laplacian = self.filter(input)
-        return laplacian
-
-class Sobel(nn.Module):
-	def __init__(self):
-		super().__init__()
-		self.filter = nn.Conv2d(in_channels=1, out_channels=2, kernel_size=3, stride=1, padding='same', padding_mode='replicate', bias=False)
-		Gx = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]])
-		Gy = torch.tensor([[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]])
-		G = torch.cat([Gx.unsqueeze(0), Gy.unsqueeze(0)], 0)
-		G = G.unsqueeze(1)
-		self.filter.weight = nn.Parameter(G, requires_grad=False)
-	def forward(self, img):
-		x = self.filter(img)
-		return x
-
+pearson = PearsonCorrCoef().cuda()
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -94,4 +69,46 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
+    
+def pearson_depth_loss(depth_src, depth_target):
+    #co = pearson(depth_src.reshape(-1), depth_target.reshape(-1))
+
+    src = depth_src - depth_src.mean()
+    target = depth_target - depth_target.mean()
+
+    src = src / (src.std() + 1e-6)
+    target = target / (target.std() + 1e-6)
+
+    co = (src * target).mean()
+    assert not torch.any(torch.isnan(co))
+    return 1 - co
+
+
+def local_pearson_loss(depth_src, depth_target, box_p, p_corr):
+        # Randomly select patch, top left corner of the patch (x_0,y_0) has to be 0 <= x_0 <= max_h, 0 <= y_0 <= max_w
+
+        num_box_h = math.floor(depth_src.shape[0]/box_p)
+        num_box_w = math.floor(depth_src.shape[1]/box_p)
+        max_h = depth_src.shape[0] - box_p
+        max_w = depth_src.shape[1] - box_p
+        _loss = torch.tensor(0.0,device='cuda')
+        n_corr = int(p_corr * num_box_h * num_box_w)
+        x_0 = torch.randint(0, max_h, size=(n_corr,), device = 'cuda')
+        y_0 = torch.randint(0, max_w, size=(n_corr,), device = 'cuda')
+        x_1 = x_0 + box_p
+        y_1 = y_0 + box_p
+        _loss = torch.tensor(0.0,device='cuda')
+        for i in range(len(x_0)):
+            _loss += pearson_depth_loss(depth_src[x_0[i]:x_1[i],y_0[i]:y_1[i]].reshape(-1), depth_target[x_0[i]:x_1[i],y_0[i]:y_1[i]].reshape(-1))
+        return _loss/n_corr
+
+def second_smoothness_loss(depth, img, laplacian, gradient):
+        img_lap = laplacian(img.unsqueeze(0), do_normalize=False)
+        depth_grad_x, depth_grad_y = torch.tensor_split(gradient(depth.unsqueeze(0)), 2, dim=1)
+        depth_grad_x2, depth_grad_xy = torch.tensor_split(gradient(depth_grad_x), 2, dim=1)
+        depth_grad_yx, depth_grad_y2 = torch.tensor_split(gradient(depth_grad_y), 2, dim=1)
+        
+        x = torch.exp(-img_lap) * (depth_grad_x2.abs() \
+            + depth_grad_xy.abs() + depth_grad_y2.abs())
+        return x.mean()
 
